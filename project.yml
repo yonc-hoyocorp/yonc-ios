@@ -1,0 +1,49 @@
+# YOnC SDK — iOS sample. Generate the Xcode project with `xcodegen generate`, then open
+# YoncSample.xcodeproj. The app consumes the Yonc Swift package exactly like a host app would.
+name: YoncSample
+options:
+  # The SDK's floor: the continued-processing background window Turbo rides is an iOS 26 API.
+  deploymentTarget:
+    iOS: "26.0"
+packages:
+  # The SDK comes from the YOnC Swift package registry (identity `yonc.sdk`). Xcode has no UI
+  # for registries, so the app depends on the small local package in Dependencies/, which
+  # declares the registry dependency and re-exports `Yonc` — see Dependencies/Package.swift for
+  # the two one-time `swift package-registry` commands.
+  YoncDependencies:
+    path: Dependencies
+targets:
+  YoncSample:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    info:
+      path: Info.plist
+      properties:
+        UILaunchScreen: {}
+        # Turbo's locked-screen continuation: the SDK submits per-session background tasks named
+        # <bundle-id>.yonc.turbo.<UUID>; this wildcard whitelists them. Without it Turbo still works
+        # in the foreground and the denial is reported, never thrown.
+        BGTaskSchedulerPermittedIdentifiers:
+          - dev.yonc.sample.yonc.turbo.*
+        # Attestation knobs for THIS sample (see README). Filled from the build settings below or
+        # the xcodebuild command line; empty = Turbo connects without attestation.
+        YoncApplicationId: "$(YONC_APPLICATION_ID)"
+        YoncExternalReportingId: "$(YONC_EXTERNAL_REPORTING_ID)"
+    entitlements:
+      path: YoncSample.entitlements
+      properties:
+        # Device attestation (App Attest) — required for the SDK's attestation to work on a device.
+        com.apple.developer.devicecheck.appattest-environment: production
+    dependencies:
+      - package: YoncDependencies
+        product: YoncDependencies
+    settings:
+      base:
+        PRODUCT_NAME: YoncSample
+        PRODUCT_BUNDLE_IDENTIFIER: dev.yonc.sample
+        SWIFT_VERSION: 5.9
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        YONC_APPLICATION_ID: ""
+        YONC_EXTERNAL_REPORTING_ID: ""

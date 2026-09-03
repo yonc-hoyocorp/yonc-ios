@@ -1,0 +1,12 @@
+# xcodegen output and build products — regenerate with `xcodegen generate`.
+YoncSample.xcodeproj/
+Info.plist
+YoncSample.entitlements
+build/
+.build/
+DerivedData/
+Package.resolved
+Dependencies/.build/
+Dependencies/.swiftpm/
+xcuserdata/
+.DS_Store
