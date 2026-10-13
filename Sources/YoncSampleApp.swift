@@ -26,20 +26,29 @@ final class SampleModel: ObservableObject {
 
     @Published var entries: [ModelEntry] = []
     @Published var status = ""
+    /// The model the network named as this device's default — what `download()` without an id fetches.
+    @Published var defaultModelId: String?
 
     // Turbo
     @Published var turboStatus = ""
     @Published var turboStats = ""
     @Published var safeState = ""
+    /// What Turbo waits for right now, in this app's words (empty while it is not held back).
+    @Published var waitingFor: [String] = []
     @Published var attestation = ""
     @Published var attestationFailed = false
+    @Published var accountError: String?
+
+    let attested: Bool
 
     var firstLocal: ModelEntryLocal? { entries.compactMap { $0 as? ModelEntryLocal }.first }
 
     init() {
+        let attestation = Self.attestationConfig()
+        attested = attestation != nil
         // The one SDK call a host makes. The handle owns the engine glue, the Kotlin graph and the
         // Turbo background continuation (see BGTaskSchedulerPermittedIdentifiers in project.yml).
-        sdk = Yonc.start(name: "yonc-ios-sample", version: "0.1.0", attestation: Self.attestationConfig())
+        sdk = Yonc.start(name: "yonc-ios-sample", version: "0.5.0", attestation: attestation)
 
         Task { [weak self] in
             // Loads what is on disk and fetches the catalogue the network offers this device.
@@ -48,6 +57,10 @@ final class SampleModel: ObservableObject {
             for await list in self.sdk.models.models {
                 self.entries = (list as? [ModelEntry]) ?? []
             }
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            for await id in self.sdk.models.defaultModelId { self.defaultModelId = id }
         }
         Task { [weak self] in
             guard let self else { return }
@@ -64,6 +77,9 @@ final class SampleModel: ObservableObject {
             guard let self else { return }
             for await s in self.sdk.turbo.safeState {
                 self.safeState = "charging \(s.isCharging) · wifi \(s.isWifi) · safe \(s.isSafe)"
+                // The SDK names the conditions that fail under THIS platform's rules (iOS never asks
+                // for a locked screen) — show these rather than re-deriving them from the signals.
+                self.waitingFor = s.unmet.map(conditionLabel).sorted()
             }
         }
         Task { [weak self] in
@@ -129,6 +145,36 @@ final class SampleModel: ObservableObject {
     func retryAttestation() {
         sdk.turbo.retryAttestation()
     }
+
+    /// The user signed in to another account: the network credits the new label from now on. Turbo
+    /// leaves its connection at once and reconnects under it. A real app also passes the current
+    /// label to `Yonc.start` on every launch.
+    func switchAccount(to label: String) {
+        do {
+            try sdk.turbo.setReportingLabel(label: label)
+            accountError = nil
+        } catch {
+            accountError = "The network would reject this label: \(error.localizedDescription)"
+        }
+    }
+}
+
+/// What the user does about each condition. Later SDK releases may add conditions: keep the default.
+func conditionLabel(_ condition: SafeCondition) -> String {
+    switch condition {
+    case .charging: return "Plug in the charger"
+    case .wifi: return "Connect to Wi-Fi"
+    case .screenLocked: return "Lock the screen"
+    case .thermal: return "Let the phone cool down"
+    case .backgroundWork: return "Allow background running"
+    @unknown default: return "\(condition)"
+    }
+}
+
+/// `tier · quant · size`. The SDK hands out bytes; units and rounding are the app's.
+func describe(_ info: ModelInfo) -> String {
+    let size = info.sizeBytes > 0 ? ByteCountFormatter.string(fromByteCount: info.sizeBytes, countStyle: .file) : ""
+    return [info.tier, info.quant, size].filter { !$0.isEmpty }.joined(separator: " · ")
 }
 
 struct ModelsScreen: View {
@@ -143,13 +189,25 @@ struct ModelsScreen: View {
                 ForEach(model.entries, id: \.info.name) { entry in
                     HStack {
                         VStack(alignment: .leading) {
-                            Text(entry.info.name).font(.headline)
-                            Text(entry.info.spec).font(.caption).foregroundStyle(.secondary)
+                            HStack {
+                                Text(entry.info.name).font(.headline)
+                                if entry.info.id as? String == model.defaultModelId {
+                                    Text("Default").font(.caption2).foregroundStyle(.tint)
+                                }
+                            }
+                            Text(describe(entry.info)).font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
                         if let downloading = entry as? ModelEntryDownloading {
-                            ProgressView(value: Double(downloading.progress))
-                                .frame(width: 80)
+                            VStack(alignment: .trailing) {
+                                ProgressView(value: Double(downloading.progress))
+                                    .frame(width: 80)
+                                if downloading.totalBytes > 0 {
+                                    Text("\(ByteCountFormatter.string(fromByteCount: downloading.receivedBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: downloading.totalBytes, countStyle: .file))")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                         } else if entry is ModelEntryLocal {
                             Button("Delete", role: .destructive) { model.delete(entry.info) }
                         } else {
@@ -180,11 +238,19 @@ struct TurboScreen: View {
                         model.toggleTurbo()
                     }
                 }
+                if !model.waitingFor.isEmpty {
+                    Section("Waiting for") {
+                        ForEach(model.waitingFor, id: \.self) { Text($0) }
+                    }
+                }
                 Section("Attestation") {
                     Text(model.attestation).font(.caption.monospaced())
                     if model.attestationFailed {
                         Button("Retry attestation") { model.retryAttestation() }
                     }
+                }
+                if model.attested {
+                    AccountSection()
                 }
                 Section {
                     Text("Turbo serves tasks while the device is charging, on Wi-Fi and cool. When the screen locks, the SDK asks iOS for a continued-processing window (a visible progress pill) to keep serving; iOS may deny or end it at any time. Attestation needs a physical device — the simulator reports Unavailable and connects unattested.")
@@ -193,6 +259,24 @@ struct TurboScreen: View {
                 }
             }
             .navigationTitle("Turbo")
+        }
+    }
+}
+
+/// The account the network credits; shown only when the sample runs with attestation.
+struct AccountSection: View {
+    @EnvironmentObject var model: SampleModel
+    @State private var label = UserDefaults.standard.string(forKey: "yoncReportingId") ?? ""
+
+    var body: some View {
+        Section("Account") {
+            TextField("Account label", text: $label)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Switch account") { model.switchAccount(to: label) }
+            if let error = model.accountError {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
         }
     }
 }

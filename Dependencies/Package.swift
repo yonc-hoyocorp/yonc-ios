@@ -18,7 +18,9 @@ let package = Package(
         .library(name: "YoncDependencies", targets: ["YoncDependencies"])
     ],
     dependencies: [
-        .package(id: "yonc.sdk", from: "0.3.0")
+        // Exact: for a 0.x version `from:` means "up to 1.0", so a fresh resolve would pick up any
+        // later, possibly breaking 0.x release. Raise it deliberately.
+        .package(id: "yonc.sdk", exact: "0.5.0")
     ],
     targets: [
         .target(

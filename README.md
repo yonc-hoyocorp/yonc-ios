@@ -10,8 +10,11 @@ needs for the SDK.
 
 ## Requirements
 
-- **iOS 26.0+**, arm64 devices. Simulators work on Apple-silicon Macs — but **device attestation
-  does not exist on the simulator** (the SDK reports `Unavailable` there).
+- The SDK **runs on iOS 26.0+**, arm64 devices. The package links into apps whose minimum is iOS
+  15.0, so an app that supports older systems keeps its minimum and calls the SDK behind
+  `if #available(iOS 26.0, *)` (this sample's own minimum is 26.0). Simulators work on
+  Apple-silicon Macs — but **device attestation does not exist on the simulator** (the SDK reports
+  `Unavailable` there).
 - Xcode 26+, Swift Package Manager. [XcodeGen](https://github.com/yonaskolb/XcodeGen) to
   generate the project from `project.yml` (`brew install xcodegen`).
 - Credentials for the YOnC package registry (issued by YOnC).
@@ -34,12 +37,15 @@ verified by SwiftPM).
 
 ```swift
 dependencies: [
-    .package(id: "yonc.sdk", from: "0.3.0")
+    .package(id: "yonc.sdk", exact: "0.5.0")
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "Yonc", package: "yonc.sdk")])
 ]
 ```
+
+Pin the version exactly. For a 0.x version SwiftPM reads `from:` as "anything below 1.0", so a
+fresh resolve would pick up a later release that can break your build; raise the pin deliberately.
 
 **In an Xcode app project** (this sample), Xcode offers no UI for registry packages: add a small
 local package that declares the registry dependency and re-exports `Yonc`, and make the app
@@ -86,11 +92,18 @@ Turbo runs the network's tasks on a model stored on the phone, so the host has t
 try await sdk.models.initialize()            // on-disk scan + the catalogue the network offers this device
 try await sdk.models.download()              // the model the network designates as default
 
-for await entries in sdk.models.models {     // [ModelEntry]: NotDownloaded / Downloading(progress) / Local
+for await entries in sdk.models.models {     // [ModelEntry]: NotDownloaded / Downloading / Local
     render(entries)
+}
+for await id in sdk.models.defaultModelId {  // which entry download() fetches; nil until the catalogue names one
+    markDefault(id)
 }
 try await sdk.models.delete(modelId: entry.info.id)
 ```
+
+Sizes are bytes: `ModelInfo.sizeBytes` is the exact download size, and a `ModelEntryDownloading`
+carries `receivedBytes` and `totalBytes` (`progress` is their ratio); all 0 while unknown. Units
+and rounding are yours, for example `ByteCountFormatter.string(fromByteCount:countStyle: .file)`.
 
 "Initialize, then download" is all a host has to do: on a first launch `download()` waits for the
 catalogue to arrive. A downloaded model is a `ModelEntryLocal`; only the SDK can create one, so
@@ -106,7 +119,7 @@ sdk.turbo.stop()
 
 for await status in sdk.turbo.status { … }      // Off, WaitingForSafeState, Connecting, Preparing, Connected, Working, Error, AttestationFailed
 for await stats in sdk.turbo.stats { … }        // tasksDone / tokensGenerated / lastHalt
-for await safe in sdk.turbo.safeState { … }     // isCharging / isWifi / thermal + the verdict isSafe
+for await safe in sdk.turbo.safeState { … }     // isCharging / isWifi / thermal + the verdict isSafe + unmet
 for await state in sdk.turbo.attestation { … }  // NotConfigured, Idle, Enrolling, Enrolled, Admitting, Unavailable, Failed
 ```
 
@@ -114,6 +127,11 @@ Turbo serves tasks only while the device is in a **safe state**: on iOS that mea
 Wi-Fi and thermally comfortable. A locked screen is not required: when the user locks the phone
 the SDK asks iOS for a continued-processing window (a visible progress pill) and keeps serving
 until iOS ends it. You observe the safe state; the SDK evaluates it.
+
+`safeState.unmet` names what holds Turbo back right now (`SafeCondition`: charging, Wi-Fi, screen
+locked, thermal, background work), under this platform's rules and only those — iOS never lists the
+screen lock. Show these to the user instead of re-deriving them from the raw signals; keep a
+default branch, later releases may add conditions.
 
 ### Battery and notifications on iOS
 
@@ -140,8 +158,11 @@ let sdk = Yonc.start(
 ```
 
 - `externalReportingId` is opaque to the SDK and the network: never parsed, never logged, no
-  personal data required. Changing it re-enrolls the device under the new label on the next Turbo
-  start. The identity is fixed for the process lifetime in this SDK version.
+  personal data required. When your user signs in to another account while the app runs, call
+  `try sdk.turbo.setReportingLabel(label:)`: Turbo leaves its connection at once (a task in flight
+  is not credited to the previous account) and re-enrolls under the new label; with Turbo off, the
+  label is used at the next start. It throws for a label the network would reject. Keep passing the
+  current label to `Yonc.start` on every launch.
 - Everything operator-side ships inside the SDK; the two values above are all a host supplies.
 - Without a config the device connects unattested; the network admits that only while
   enforcement is off for your application.
@@ -152,7 +173,19 @@ let sdk = Yonc.start(
 
 This sample reads the two values from launch arguments (`-yoncApplicationId`, `-yoncReportingId`)
 or from Info.plist keys filled by the build settings `YONC_APPLICATION_ID` /
-`YONC_EXTERNAL_REPORTING_ID` — see `project.yml`.
+`YONC_EXTERNAL_REPORTING_ID` — see `project.yml`. With both set, the Turbo tab also shows an
+account field to try `setReportingLabel`.
+
+## 6a. Another Router (optional)
+
+By default the SDK talks to the YOnC network its release was built for. A partner that runs its
+own YOnC Router instance (for example an in-country deployment) passes its address:
+
+```swift
+let sdk = Yonc.start(name: "MyApp", version: "1.0", routerUrl: URL(string: "https://router.example/"))
+```
+
+Attestation values are issued per Router: use the `applicationId` issued for that Router.
 
 ## 7. Build and run
 
@@ -178,8 +211,7 @@ xcodebuild -project YoncSample.xcodeproj -scheme YoncSample \
 
 ## Known limitations
 
-- Attestation needs a physical device with the App Attest entitlement; the identity is fixed at
-  `Yonc.start`.
+- Attestation needs a physical device with the App Attest entitlement.
 - Downloads are foreground-only and do not resume.
 - If your app embeds another Kotlin/Native framework, the console warns about a duplicate Kotlin
   runtime; the warning is cosmetic, but the combination is untested — tell us if you need it.
