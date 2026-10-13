@@ -27,7 +27,7 @@ final class SampleModel: ObservableObject {
     @Published var entries: [ModelEntry] = []
     @Published var status = ""
     /// The model the network named as this device's default — what `download()` without an id fetches.
-    @Published var defaultModelId: String?
+    @Published var defaultModelId: ModelId?
 
     // Turbo
     @Published var turboStatus = ""
@@ -191,7 +191,7 @@ struct ModelsScreen: View {
                         VStack(alignment: .leading) {
                             HStack {
                                 Text(entry.info.name).font(.headline)
-                                if entry.info.id as? String == model.defaultModelId {
+                                if entry.info.id == model.defaultModelId {
                                     Text("Default").font(.caption2).foregroundStyle(.tint)
                                 }
                             }

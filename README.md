@@ -95,10 +95,10 @@ try await sdk.models.download()              // the model the network designates
 for await entries in sdk.models.models {     // [ModelEntry]: NotDownloaded / Downloading / Local
     render(entries)
 }
-for await id in sdk.models.defaultModelId {  // which entry download() fetches; nil until the catalogue names one
+for await id in sdk.models.defaultModelId {  // ModelId?: which entry download() fetches; nil until the catalogue names one
     markDefault(id)
 }
-try await sdk.models.delete(modelId: entry.info.id)
+try await sdk.models.delete(modelId: entry.info.id)   // ids are ModelId; `.value` is the network's text
 ```
 
 Sizes are bytes: `ModelInfo.sizeBytes` is the exact download size, and a `ModelEntryDownloading`
