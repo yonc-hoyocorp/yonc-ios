@@ -1,9 +1,9 @@
 import SwiftUI
 import Yonc
 
-// The whole partner surface in one small app: one downloaded model and Turbo Mode with its
-// safe-state and attestation read-outs. `import Yonc` is the only import — the package re-exports
-// the Swift facade and the Kotlin-exported types.
+// The whole partner surface in one small app: one downloaded model, on-device chat with it, and
+// Turbo Mode with its safe-state and attestation read-outs. `import Yonc` is the only import — the
+// package re-exports the Swift facade and the Kotlin-exported types.
 
 @main
 struct YoncSampleApp: App {
@@ -13,6 +13,7 @@ struct YoncSampleApp: App {
         WindowGroup {
             TabView {
                 ModelsScreen().tabItem { Label("Model", systemImage: "square.and.arrow.down") }
+                ChatScreen().tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
                 TurboScreen().tabItem { Label("Turbo", systemImage: "bolt") }
             }
             .environmentObject(model)
@@ -39,16 +40,29 @@ final class SampleModel: ObservableObject {
     @Published var attestationFailed = false
     @Published var accountError: String?
 
+    // On-device chat
+    @Published var chatAvailability: ChatAvailability = .noModel
+    /// The committed exchanges, answer text only, as the SDK keeps them.
+    @Published var chatHistory: [ChatMessage] = []
+    /// The message in flight and its answer so far; nil between replies.
+    @Published var chatQuestion: String?
+    @Published var chatAnswer = ""
+    @Published var chatError: String?
+
     let attested: Bool
 
     var firstLocal: ModelEntryLocal? { entries.compactMap { $0 as? ModelEntryLocal }.first }
+
+    /// The open conversation. The SDK keeps its history and builds every prompt from it.
+    private var chatSession: LocalChatSession?
+    private var chatReply: Task<Void, Never>?
 
     init() {
         let attestation = Self.attestationConfig()
         attested = attestation != nil
         // The one SDK call a host makes. The handle owns the engine glue, the Kotlin graph and the
         // Turbo background continuation (see BGTaskSchedulerPermittedIdentifiers in project.yml).
-        sdk = Yonc.start(name: "yonc-ios-sample", version: "0.5.0", attestation: attestation)
+        sdk = Yonc.create(name: "yonc-ios-sample", version: "0.6.0", attestation: attestation)
 
         Task { [weak self] in
             // Loads what is on disk and fetches the catalogue the network offers this device.
@@ -57,6 +71,10 @@ final class SampleModel: ObservableObject {
             for await list in self.sdk.models.models {
                 self.entries = (list as? [ModelEntry]) ?? []
             }
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            for await a in self.sdk.localChat.availability { self.chatAvailability = a }
         }
         Task { [weak self] in
             guard let self else { return }
@@ -146,9 +164,65 @@ final class SampleModel: ObservableObject {
         sdk.turbo.retryAttestation()
     }
 
+    /// Sends `text` in the open conversation, opening one on the first downloaded model when none
+    /// is open. Tokens flagged as thinking (models that reason) are dropped here — a real app may
+    /// show them folded away. One reply at a time per session.
+    func sendChat(_ text: String) {
+        let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty, chatReply == nil else { return }
+        let session: LocalChatSession
+        if let open = chatSession {
+            session = open
+        } else {
+            guard let local = firstLocal else { return }
+            session = sdk.localChat.session(model: local)
+            chatSession = session
+        }
+        chatQuestion = message
+        chatAnswer = ""
+        chatError = nil
+        chatReply = Task {
+            do {
+                for try await event in session.send(message) where !event.thinking {
+                    chatAnswer += event.text
+                }
+            } catch let ChatError.unavailable(reason) {
+                chatError = "Chat is unavailable: \(reason)"
+            } catch is CancellationError {
+                // Stopped by the user: what they saw stays in the history.
+            } catch {
+                chatError = "\(error)"
+            }
+            // The session's history is the truth: a completed, stopped or failed reply all leave
+            // their text there (a stopped one keeps what the user saw).
+            chatHistory = session.history
+            chatQuestion = nil
+            chatAnswer = ""
+            chatReply = nil
+        }
+    }
+
+    /// Stops the reply in flight; what the user saw stays in the history.
+    func cancelChat() {
+        chatReply?.cancel()
+    }
+
+    /// Ends the conversation: a reply in flight stops, the history is discarded and, unless Turbo
+    /// is on, the model is unloaded from memory. The next message opens a new conversation and
+    /// loads the model again. A real app calls this when its chat screen closes.
+    func closeChat() {
+        chatReply?.cancel()
+        chatSession?.close()
+        chatSession = nil
+        chatHistory = []
+        chatQuestion = nil
+        chatAnswer = ""
+        chatError = nil
+    }
+
     /// The user signed in to another account: the network credits the new label from now on. Turbo
     /// leaves its connection at once and reconnects under it. A real app also passes the current
-    /// label to `Yonc.start` on every launch.
+    /// label to `Yonc.create` on every launch.
     func switchAccount(to label: String) {
         do {
             try sdk.turbo.setReportingLabel(label: label)
@@ -220,6 +294,70 @@ struct ModelsScreen: View {
                 }
             }
             .navigationTitle("Model")
+        }
+    }
+}
+
+/// A conversation with the downloaded model, on this phone. The SDK keeps the history and builds
+/// every prompt; the screen hands it the next message and renders what comes back.
+struct ChatScreen: View {
+    @EnvironmentObject var model: SampleModel
+    @State private var draft = ""
+
+    private var ready: Bool { model.chatAvailability == .ready }
+    private var replying: Bool { model.chatQuestion != nil }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("availability: \(String(describing: model.chatAvailability))").font(.caption.monospaced())
+                    Text("Runs on this phone's engine with the downloaded model; nothing the user types leaves the device. Chat and Turbo share the engine, so chat works only while Turbo is off.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Conversation") {
+                    ForEach(Array(model.chatHistory.enumerated()), id: \.offset) { _, message in
+                        ChatLine(who: message.role == .model ? "Model" : "You", text: message.content)
+                    }
+                    if let question = model.chatQuestion {
+                        ChatLine(who: "You", text: question)
+                        ChatLine(who: "Model", text: model.chatAnswer.isEmpty ? "…" : model.chatAnswer)
+                    }
+                    if let error = model.chatError {
+                        Text(error).font(.caption).foregroundStyle(.red)
+                    }
+                }
+                Section {
+                    TextField("Message", text: $draft, axis: .vertical)
+                        .disabled(!ready || replying)
+                    HStack {
+                        if replying {
+                            Button("Stop") { model.cancelChat() }
+                        } else {
+                            Button("Send") { model.sendChat(draft); draft = "" }
+                                .disabled(!ready || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                        Spacer()
+                        if !model.chatHistory.isEmpty || replying {
+                            Button("Close chat", role: .destructive) { model.closeChat() }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Chat")
+        }
+    }
+}
+
+private struct ChatLine: View {
+    let who: String
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(who).font(.caption2).foregroundStyle(.tint)
+            Text(text)
         }
     }
 }

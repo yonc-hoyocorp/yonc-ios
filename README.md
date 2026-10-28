@@ -1,12 +1,18 @@
 # YOnC SDK — iOS sample
 
 A small SwiftUI app that integrates the YOnC iOS SDK the way a partner app does: download the
-model the network assigns to the iPhone, then switch on **Turbo Mode** — the phone contributes
-its idle compute to the YOnC network while it charges, and the network reports what each of your
-users earned.
+model the network assigns to the iPhone, chat with it **on the device**, and switch on **Turbo
+Mode** — the phone contributes its idle compute to the YOnC network while it charges, and the
+network reports what each of your users earned.
 
 One Swift file holds the whole integration; `project.yml` holds the three things an Xcode target
 needs for the SDK.
+
+**0.6.0:** on-device chat — `sdk.localChat` opens a conversation with a downloaded model and
+streams the reply; it runs only while Turbo is off (section 7). `ModelInfo.licenseUrl` links each
+model's licence terms. The entry point is `Yonc.create`, the name Android and Flutter use;
+`Yonc.start`, its 0.5.0 name, still compiles and is deprecated. Reporting a problem: section 9. No
+breaking change: a 0.5.0 integration moves to 0.6.0 without code changes.
 
 ## Requirements
 
@@ -37,7 +43,7 @@ verified by SwiftPM).
 
 ```swift
 dependencies: [
-    .package(id: "yonc.sdk", exact: "0.5.0")
+    .package(id: "yonc.sdk", exact: "0.6.1")
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "Yonc", package: "yonc.sdk")])
@@ -72,16 +78,16 @@ SwiftPM (`swift package resolve` in `Dependencies/`, credentials via `~/.netrc`)
 Recommended for multi-GB models: `com.apple.developer.kernel.increased-memory-limit` and
 `com.apple.developer.kernel.extended-virtual-addressing`.
 
-## 3. Start the SDK once
+## 3. Create the SDK once
 
 ```swift
 import Yonc
 
-let sdk = Yonc.start(name: "MyApp", version: "1.0")
+let sdk = Yonc.create(name: "MyApp", version: "1.0")
 ```
 
 Keep the returned handle for the app's lifetime; it owns the engine glue, the SDK graph and the
-Turbo background continuation. The handle exposes `models` and `turbo`.
+Turbo background continuation. The handle exposes `models`, `turbo` and `localChat`.
 
 ## 4. One model on the device
 
@@ -104,6 +110,10 @@ try await sdk.models.delete(modelId: entry.info.id)   // ids are ModelId; `.valu
 Sizes are bytes: `ModelInfo.sizeBytes` is the exact download size, and a `ModelEntryDownloading`
 carries `receivedBytes` and `totalBytes` (`progress` is their ratio); all 0 while unknown. Units
 and rounding are yours, for example `ByteCountFormatter.string(fromByteCount:countStyle: .file)`.
+
+`ModelInfo.licenseUrl` is a link to the model's licence terms, served with the catalogue (empty
+when the network has none for an entry). Show it beside the model — on the row, or in your About
+screen — so your users can read the terms of the model they run.
 
 "Initialize, then download" is all a host has to do: on a first launch `download()` waits for the
 catalogue to arrive. A downloaded model is a `ModelEntryLocal`; only the SDK can create one, so
@@ -144,10 +154,10 @@ by itself when iOS grants a new window; you only observe `turbo.status`.
 ## 6. Attestation and your user id
 
 The network verifies that a device is genuine (App Attest) before it takes part, and reports
-per-user totals back to you under an id you choose. Both ride in the start call:
+per-user totals back to you under an id you choose. Both ride in the create call:
 
 ```swift
-let sdk = Yonc.start(
+let sdk = Yonc.create(
     name: "MyApp",
     version: "1.0",
     attestation: AttestationConfig(
@@ -162,7 +172,7 @@ let sdk = Yonc.start(
   `try sdk.turbo.setReportingLabel(label:)`: Turbo leaves its connection at once (a task in flight
   is not credited to the previous account) and re-enrolls under the new label; with Turbo off, the
   label is used at the next start. It throws for a label the network would reject. Keep passing the
-  current label to `Yonc.start` on every launch.
+  current label to `Yonc.create` on every launch.
 - Everything operator-side ships inside the SDK; the two values above are all a host supplies.
 - Without a config the device connects unattested; the network admits that only while
   enforcement is off for your application.
@@ -182,12 +192,83 @@ By default the SDK talks to the YOnC network its release was built for. A partne
 own YOnC Router instance (for example an in-country deployment) passes its address:
 
 ```swift
-let sdk = Yonc.start(name: "MyApp", version: "1.0", routerUrl: URL(string: "https://router.example/"))
+let sdk = Yonc.create(name: "MyApp", version: "1.0", routerUrl: URL(string: "https://router.example/"))
 ```
 
 Attestation values are issued per Router: use the `applicationId` issued for that Router.
 
-## 7. Build and run
+## 7. On-device chat
+
+`sdk.localChat` runs conversations on the phone's own engine with a model already on the device.
+Nothing the user types and nothing the model answers leaves the phone: a chat turn sends nothing
+to the network.
+
+```swift
+for await availability in sdk.localChat.availability { … }   // .ready, .noModel, .turboOn
+
+let session = sdk.localChat.session(model: local)             // a new, empty conversation on a ModelEntryLocal
+for try await event in session.send("Salom!") {               // AsyncThrowingStream<TokenEvent, Error>
+    if !event.thinking { answer += event.text }               // reasoning (models that think) is flagged, the answer is plain text
+}
+session.model                                                 // the ModelEntryLocal it runs on
+session.history                                               // [ChatMessage]: the committed exchanges, answer text only
+session.lastTokenCounts                                       // engine-counted input/output tokens of the last completed reply
+session.reset()                                               // start over in place
+session.close()                                               // end the conversation: history discarded, model unloaded
+```
+
+- **Availability.** `.ready`, `.noModel` (nothing downloaded yet) or `.turboOn`; `value` is the
+  current state, iteration yields it first and then every change. Read it before showing the chat
+  entry; this sample disables the message field otherwise. Chat does not gate on battery, charging
+  or temperature, needs no attestation and no YOnC consent — only a downloaded model.
+- **Chat and Turbo share the device's one engine, so chat runs only while Turbo is off.** A message
+  sent while Turbo is on throws `ChatError.unavailable(.turboOn)` before it reaches the engine;
+  switching Turbo on stops a reply in flight the same way. After Turbo is switched off, chat is
+  available again within seconds. Chat never interrupts a network task, so it does not touch
+  earnings, Turbo statistics or attestation.
+- **One conversation at a time.** `session(model:)` starts a new, empty conversation. It keeps its
+  own history and builds every prompt from it; you pass only the next message. The engine holds one
+  conversation: switching between two sessions rebuilds the other's context on its next message.
+- **`send` streams.** The stream finishes when the reply is complete, or throws. Cancelling the
+  iterating task stops the generation (`CancellationError`). The first message loads the model,
+  which takes seconds on a large model. One reply at a time per session. Every `TokenEvent` carries
+  the engine's metrics (`metrics.ttftMs`, `metrics.decodeTokenCount`, `metrics.decodeTokS`). A
+  stopped or failed reply keeps its partial answer in `history`, and the next message continues.
+- **Errors:** `ChatError.unavailable(reason)` (Turbo on, also mid-reply) and `ChatError.failed(message)`
+  for everything else — the model could not be loaded or is damaged (delete and download again),
+  the engine stopped, a reply was already streaming in this session, or the session was closed.
+  The next message retries.
+- **Lifecycle.** While a chat is in use, the engine keeps the model loaded in the app's process.
+  `close()` ends the conversation for good: a reply in flight stops, the history is discarded and
+  the model is unloaded from memory, unless Turbo is on or another session's reply is streaming.
+  The session is finished (a later `send` throws `ChatError.failed`); the next conversation is a
+  new `session(model:)`, whose first message loads the model again. Call it when your chat screen
+  closes (this sample's *Close chat* button). Chat needs no Info.plist key or entitlement of its
+  own; the memory entitlements in section 2 help the larger models.
+- **Limits.** One reply at a time per session, one conversation at a time on the engine. The
+  context window and what happens when a conversation outgrows it are not specified in this
+  release: keep conversations short and start over with `reset()` or a new session.
+- **Models and languages.** Any downloaded catalogue model can open a conversation (section 4).
+  Gemma 3 1B, the model the network assigns by default, is the one chat is checked with; the others
+  are possible but not the default. Gemma 3 1B is a small general model: it has not been measured
+  in Uzbek or Russian, and a model of this size is not expected to hold a conversation in Uzbek
+  well.
+- **Generation options.** None in this release: a model's `temperature` from the catalogue sets
+  its sampling, and every chat reply runs under a repetition penalty (1.1 over the last 64 tokens,
+  the same on iOS and Android) so a small model escapes verbatim loops. A system prompt,
+  temperature and output length per conversation are planned; tell YOnC which you need and in
+  which chat scenarios.
+- **Privacy.** A chat turn sends nothing to the network: the user's messages and the model's
+  replies stay on the phone. The SDK uses the network for the model catalogue, model downloads and
+  Turbo. The SDK applies no content filtering of its own; the models carry only their own
+  training, so any filtering your app needs is on your side.
+- **Testing the states.** Delete the downloaded model and availability is `.noModel`; switch Turbo
+  on and it is `.turboOn`; with a model on the phone and Turbo off it is `.ready`. Engine failures
+  and thermal limits cannot be forced from the app. The smallest model in the catalogue is
+  Gemma 3 1B; there is no smaller test model. To test against the YOnC test or UAT Router, pass
+  its address as `routerUrl` (section 6a) with the application id issued for it.
+
+## 8. Build and run
 
 ```
 xcodegen generate
@@ -202,6 +283,16 @@ xcodebuild -project YoncSample.xcodeproj -scheme YoncSample \
   YONC_APPLICATION_ID=<id> YONC_EXTERNAL_REPORTING_ID=<user>
 ```
 
+## 9. Reporting a problem
+
+The SDK has no debug flag. With a bug report send YOnC:
+
+- the steps to reproduce;
+- the SDK version (the `yonc.sdk` version you pinned);
+- the iPhone model and iOS version;
+- the log around the failure: the Xcode console of a run from Xcode, or a Console.app capture
+  (the phone selected; the SDK's background-work lines carry the subsystem `dev.yonc.sdk`).
+
 ## App Store notes
 
 - Both SDK frameworks ship privacy manifests (`PrivacyInfo.xcprivacy`): no tracking, no data
@@ -213,5 +304,8 @@ xcodebuild -project YoncSample.xcodeproj -scheme YoncSample \
 
 - Attestation needs a physical device with the App Attest entitlement.
 - Downloads are foreground-only and do not resume.
+- Chat and Turbo share the engine: no chat while Turbo is on (section 7). Chat has no system
+  prompt, sampling or output-length options yet, and a small model is not expected to hold a
+  conversation in every language.
 - If your app embeds another Kotlin/Native framework, the console warns about a duplicate Kotlin
   runtime; the warning is cosmetic, but the combination is untested — tell us if you need it.
