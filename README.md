@@ -43,7 +43,7 @@ verified by SwiftPM).
 
 ```swift
 dependencies: [
-    .package(id: "yonc.sdk", exact: "0.6.1")
+    .package(id: "yonc.sdk", exact: "0.6.2")
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "Yonc", package: "yonc.sdk")])
@@ -234,10 +234,10 @@ session.close()                                               // end the convers
   which takes seconds on a large model. One reply at a time per session. Every `TokenEvent` carries
   the engine's metrics (`metrics.ttftMs`, `metrics.decodeTokenCount`, `metrics.decodeTokS`). A
   stopped or failed reply keeps its partial answer in `history`, and the next message continues.
-- **Errors:** `ChatError.unavailable(reason)` (Turbo on, also mid-reply) and `ChatError.failed(message)`
-  for everything else — the model could not be loaded or is damaged (delete and download again),
-  the engine stopped, a reply was already streaming in this session, or the session was closed.
-  The next message retries.
+- **Errors:** `ChatError.unavailable(reason)` (Turbo on, also mid-reply), `ChatError.busy` (a reply
+  was already streaming in this session) and `ChatError.failed(message)` for everything else — the
+  model could not be loaded or is damaged (delete and download again), the engine stopped, or the
+  session was closed. The next message retries.
 - **Lifecycle.** While a chat is in use, the engine keeps the model loaded in the app's process.
   `close()` ends the conversation for good: a reply in flight stops, the history is discarded and
   the model is unloaded from memory, unless Turbo is on or another session's reply is streaming.
